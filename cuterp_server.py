@@ -15,12 +15,17 @@ g_dev_socks = []
 
 def get_idle_sock() :
     rets = None
-    for s in g_dev_socks :
-        if not s['use'] :
-            rets = s
-            break
-    if not rets :
-        return None
+    count = 0
+    while (not rets) :
+        for s in g_dev_socks :
+            if not s['use'] :
+                rets = s
+                break
+        time.sleep(0.1)
+        count += 1
+        if count > 100 : break
+
+    if not rets : return None
     g_dev_socks.remove(rets)
     return rets['sock']
 
@@ -65,39 +70,37 @@ class TheServer:
                     self.on_recv()
 
     def on_accept(self):
-        forward = get_idle_sock()
         clientsock, clientaddr = self.server.accept()
         print clientaddr, "has connected"
-        if forward :
-            self.input_list.append(clientsock)
-            self.input_list.append(forward)
-            self.channel[clientsock] = forward
-            self.channel[forward] = clientsock
-        else:
-            print "Can't establish connection with remote server.",
-            print "Closing connection with client side", clientaddr
-            clientsock.close()
+        self.input_list.append(clientsock)
+        print 'input list len =', len(self.input_list)
 
     def on_close(self):
-        print self.s.getpeername(), "has disconnected"
-        #remove objects from input_list
+        print 'on close'
+        #print self.s.getpeername(), "has disconnected"
         self.input_list.remove(self.s)
-        self.input_list.remove(self.channel[self.s])
-        out = self.channel[self.s]
-        # close the connection with client
-        self.channel[out].close()  # equivalent to do self.s.close()
-        # close the connection with remote server
-        self.channel[self.s].close()
-        # delete both objects from channel dict
-        del self.channel[out]
-        del self.channel[self.s]
+        self.s.close()
+
+        if self.s in self.channel :
+            out = self.channel[self.s]
+            self.input_list.remove(out)
+            out.close()
+            del self.channel[out]
+            del self.channel[self.s]
+        else :
+            print 'not in channel'
 
     def on_recv(self):
-        data = self.data
+        if not self.s in self.channel :
+            forward = get_idle_sock()
+            if forward :
+                self.input_list.append(forward)
+                self.channel[self.s] = forward
+                self.channel[forward] = self.s
         # here we can parse and/or modify the data before send forward
         #print data
         #request = HTTPRequest(data)
-        self.channel[self.s].send(data)
+        self.channel[self.s].send(self.data)
 
 
 def dev_loop() :
@@ -123,7 +126,7 @@ def dev_loop() :
             if len(data) == 0:
                 input_list.remove(s)
                 s.close()
-                print 'dev loop socket close:', s.getpeername()
+                print 'dev loop socket close'
                 break
 
             input_list.remove(s)
@@ -141,8 +144,4 @@ if __name__ == '__main__':
    devt.start()
 
    server = TheServer('', 5801)
-   try:
-       server.main_loop()
-   except KeyboardInterrupt:
-       print "Ctrl C - Stopping server"
-       sys.exit(1)
+   server.main_loop()
