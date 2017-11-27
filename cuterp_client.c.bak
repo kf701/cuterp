@@ -134,7 +134,6 @@ int _rio_send(int sock, char* buf, int size)
     return size;
 }
 
-
 char* g_server_ip   = "139.224.236.202";
 int   g_server_port = 5800;
 char* g_domain      = "test1";
@@ -142,30 +141,120 @@ char* g_domain      = "test1";
 int g_socks_total = 0;
 int g_socks_idle  = 0;
 
+void* sock_thread(void* arg)
+{
+    pthread_detach(pthread_self());
+
+    int sock = _tcp_connect(g_server_ip, g_server_port);
+    if (sock == -1) {
+        printf ("connect to server error\n");
+        return NULL;
+    }
+    _make_non_blocking(sock);
+
+    g_socks_total ++;
+    g_socks_idle ++;
+
+	_rio_send(sock, g_domain, strlen(g_domain));
+
+    time_t last = time(NULL);
+    int local_sock = -1;
+    int nread, nsend;
+    char buf[1024];
+    int exit_flag = 0;
+
+    while(exit_flag == 0) 
+    {
+        if ((time(NULL) - last) > 10) {
+            break;
+        }
+
+        while (_wait_read_able(sock, 100))
+        {
+            nread = read(sock, buf, 1024);
+            if(nread <= 0) {
+                if (errno == EAGAIN) {
+                    usleep(100*1000);
+                    continue;
+                }
+                printf("read sock error, exit\n");
+                exit_flag = 1;
+                break;
+            }
+
+            last = time(NULL);
+
+            if (-1 == local_sock) {
+                local_sock = _tcp_connect("127.0.0.1", 80);
+                if (-1 == local_sock) {
+                    printf("connect to 127.0.0.1 error, exit\n");
+                    exit_flag = 1;
+                    break;
+                }
+                _make_non_blocking(local_sock);
+                g_socks_idle --;
+            }
+
+            nsend = _rio_send(local_sock, buf, nread);
+            if (nsend != nread) {
+                printf ("forward to 127 nsend = %d, nread = %d, errno = %d\n", nsend, nread, errno);
+                exit_flag = 1;
+                break;
+            }
+        }
+
+        while (local_sock != -1 && _wait_read_able(local_sock, 100))
+        {
+            nread = read(local_sock, buf, 1024);
+            if(nread <= 0) {
+                if (errno == EAGAIN) {
+                    usleep(100*1000);
+                    continue;
+                }
+                printf("read local sock error, exit\n");
+                exit_flag = 1;
+                break;
+            }
+
+            last = time(NULL);
+
+            nsend = _rio_send(sock, buf, nread);
+            if (nsend != nread) {
+                printf ("forward to server nsend = %d, nread = %d, errno = %d\n", nsend, nread, errno);
+                exit_flag = 1;
+                break;
+            }
+        }
+    }
+
+    g_socks_total --;
+    if ((time(NULL) - last) > 10) g_socks_idle --;
+
+    if (local_sock) close(local_sock);
+    close(sock);
+    return NULL;
+}
 
 int main(int argc,char*argv[])
 {
     signal(SIGPIPE,SIG_IGN);
 
-    int sock = _tcp_connect(g_server_ip, g_server_port);
-    if (sock == -1) {
-        printf ("connect to server error\n");
-        return 1;
-    }
-    _make_non_blocking(sock);
+    pthread_t tid;
 
-	_rio_send(sock, g_domain, strlen(g_domain));
-
-    while (_wait_read_able(sock, 100))
-    {
-        nread = read(sock, buf, 1024);
-        if(nread <= 0) {
-            if (errno == EAGAIN) {
-                usleep(100*1000);
-                continue;
+    int pc = 0;
+    while(1) {
+        if (g_socks_idle < 2 && g_socks_total < 10) {
+            if (0 != pthread_create(&tid, NULL, sock_thread, NULL)) {
+                perror("create sock thread error");
             }
-            break;
         }
+
+        pc ++;
+        if (pc > 100) {
+            pc = 0;
+            printf ("g_socks_total = %d, g_socks_idle = %d\n", g_socks_total, g_socks_idle);
+        }
+        usleep (50*1000);
     }
 
     return 0;
