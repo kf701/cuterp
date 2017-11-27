@@ -134,14 +134,184 @@ int _rio_send(int sock, char* buf, int size)
     return size;
 }
 
+#define MAXEVENTS 64
+
+void add_to_epoll(int efd, int sock)
+{
+    struct epoll_event event;
+    event.data.fd = sock;
+    event.events= EPOLLIN | EPOLLET;
+    event.events= EPOLLIN;
+    if (-1 == epoll_ctl(efd, EPOLL_CTL_ADD, sock, &event)) {
+        perror("epoll_ctl");
+        abort();
+    }
+}
+
+#define HEAD_SIZE  8
+struct _head_t {
+    unsigned char buf[HEAD_SIZE];
+    int type;
+    int index;
+    int length;
+};
+
+int _read_head(int sock, struct _head_t * head)
+{
+    int count = read(sock, head->buf, HEAD_SIZE);
+    if (count != HEAD_SIZE) {
+        return -1;
+    }
+
+    head->type = head->buf[0];
+    head->index = head->buf[1];
+    head->length = head->buf[4] << 24 | head->buf[5] << 16 | head->buf[6] << 8 |  head->buf[7];
+    return HEAD_SIZE;
+}
 
 char* g_server_ip   = "139.224.236.202";
 int   g_server_port = 5800;
 char* g_domain      = "test1";
 
-int g_socks_total = 0;
-int g_socks_idle  = 0;
+struct _sock_list_t {
+    int index;
+    int sock;
+};
 
+#define MAX_LIST 100
+struct _sock_list_t sock_list[MAX_LIST];
+
+void add_local_sock(int sock, int index)
+{
+    int i = 0;
+    for (i = 0; i < MAX_LIST; i++ )
+    {
+        if (sock_list[i].index == 0) {
+            sock_list[i].index = index;
+            sock_list[i].sock = sock;
+            break;
+        }
+    }
+}
+
+void del_local_by_sock(int sock)
+{
+    int i = 0;
+    for (i = 0; i < MAX_LIST; i++ )
+    {
+        if (sock_list[i].sock == sock) {
+            sock_list[i].index = 0;
+            sock_list[i].sock = 0;
+            break;
+        }
+    }
+}
+
+int get_index_by_sock(int sock)
+{
+    int i = 0;
+    for (i = 0; i < MAX_LIST; i++ )
+    {
+        if (sock_list[i].sock == sock) {
+            return sock_list[i].index;
+        }
+    }
+    return 0;
+}
+
+int find_local_by_index(int efd, int index)
+{
+    int i = 0;
+    for (i = 0; i < MAX_LIST; i++ )
+    {
+        if (sock_list[i].index == index) {
+            return sock_list[i].sock;
+        }
+    }
+
+    int local_sock = _tcp_connect("127.0.0.1", 80);
+    if (-1 == local_sock) {
+        printf("connect to 127.0.0.1 error, exit\n");
+        abort();
+    }
+    _make_non_blocking(local_sock);
+
+    add_local_sock(local_sock, index);
+
+    add_to_epoll(efd, local_sock);
+
+    return local_sock;
+}
+
+void send_register_info(int sock)
+{
+    char buf[128] = {0};
+    buf[0] = 'i';
+    int len = strlen(g_domain);
+    buf[7] = len;
+    sprintf(buf+8, "%s", g_domain);
+	_rio_send(sock, buf, 8+len);
+}
+
+int forward_to_local(int local_sock, int sock, int index, int length)
+{
+    char buf[4096];
+    int count = length, ret = 0, readlen = 0, realsend = 0;
+
+    while (count > 0) {
+
+        if (count > 4096) readlen = 4096;
+        else readlen = count ;
+        ret = read(sock, buf, readlen);
+        if(ret <= 0) {
+            if (errno == EAGAIN) {
+                usleep(100*1000);
+                continue;
+            }
+            break;
+        }
+        count -= ret;
+        realsend = _rio_send(local_sock, buf, ret);
+        if (realsend != ret) {
+            printf ("forward_packet, error, send = %d, real = %d, errno = %d\n", ret, realsend, errno);
+            break;
+        }
+    }
+    
+    return (length - count);
+}
+
+int forward_to_server(int local_sock, int sock)
+{
+    int index = get_index_by_sock(local_sock);
+    if (index == 0) return -1;
+
+    char buf[4096], headbuf[8];
+    headbuf[0] = 'd';
+    headbuf[1] = index;
+    int ret = 0, total = 0;
+
+    while (1) {
+        ret = read(local_sock, buf, sizeof(buf));
+        if (ret <= 0) break;
+
+        headbuf[4] = (ret >> 24) & 0xFF;
+        headbuf[5] = (ret >> 16) & 0xFF;
+        headbuf[6] = (ret >> 8) & 0xFF;
+        headbuf[7] = ret & 0xFF;
+
+        if (8 != _rio_send(sock, headbuf, 8)) {
+            break;
+        }
+        if (ret != _rio_send(sock, buf, ret)) {
+            break;
+        }
+
+        total += ret;
+    }
+
+    return total;
+}
 
 int main(int argc,char*argv[])
 {
@@ -150,24 +320,60 @@ int main(int argc,char*argv[])
     int sock = _tcp_connect(g_server_ip, g_server_port);
     if (sock == -1) {
         printf ("connect to server error\n");
-        return 1;
+        abort();
     }
     _make_non_blocking(sock);
 
-	_rio_send(sock, g_domain, strlen(g_domain));
+    send_register_info(sock);
 
-    while (_wait_read_able(sock, 100))
+    int efd = epoll_create1(0);
+    if(efd == -1) {
+        perror("epoll_create");
+        abort();
+    }
+    add_to_epoll(efd, sock);
+
+    struct epoll_event* events = calloc(MAXEVENTS, sizeof(struct epoll_event));
+
+    struct _head_t head;
+    int evn = 0, i = 0, local_sock, nread;
+
+    while (1) 
     {
-        nread = read(sock, buf, 1024);
-        if(nread <= 0) {
-            if (errno == EAGAIN) {
-                usleep(100*1000);
+        evn = epoll_wait(efd, events, MAXEVENTS, -1);
+
+        for(i = 0 ; i < evn ; i++){
+            if((events[i].events & EPOLLERR)|| (events[i].events & EPOLLHUP)|| (!(events[i].events & EPOLLIN))) {
+                printf("epoll error\n");
+                del_local_by_sock(events[i].data.fd);
+                close(events[i].data.fd);
+                if(sock == events[i].data.fd) {
+                    abort();
+                }
                 continue;
             }
-            break;
+
+            if(sock == events[i].data.fd) {
+                nread = _read_head(sock, &head);
+                if (nread != HEAD_SIZE) {
+                    if (errno == EAGAIN) {
+                        usleep(100*1000);
+                        continue;
+                    }
+                    abort();
+                }
+             
+                local_sock = find_local_by_index(efd, head.index);
+                forward_to_local(local_sock, sock, head.index, head.length);
+                continue;
+            }
+
+            if (forward_to_server(events[i].data.fd, sock) < 0) {
+                del_local_by_sock(events[i].data.fd);
+                close(events[i].data.fd);
+            }
         }
     }
 
     return 0;
 }
-

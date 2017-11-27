@@ -29,6 +29,17 @@ def get_idle_sock() :
     g_dev_socks.remove(rets)
     return rets['sock']
 
+def del_sock(sock) :
+    rets = None
+    for s in g_dev_socks :
+        if s['sock'] == sock :
+            rets = s
+            break
+
+    if not rets : return 
+    g_dev_socks.remove(rets)
+
+
 class HTTPRequest(BaseHTTPRequestHandler):
     def __init__(self, request_text):
         self.rfile = StringIO(request_text)
@@ -100,7 +111,7 @@ class TheServer:
         # here we can parse and/or modify the data before send forward
         #print data
         #request = HTTPRequest(data)
-        self.channel[self.s].send(self.data)
+        self.channel[self.s].sendall(self.data)
 
 
 def dev_loop() :
@@ -124,6 +135,7 @@ def dev_loop() :
 
             data = s.recv(128)
             if len(data) == 0:
+                del_sock(s)
                 input_list.remove(s)
                 s.close()
                 print 'dev loop socket close'
