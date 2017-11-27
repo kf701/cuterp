@@ -11,33 +11,19 @@ from StringIO import StringIO
 
 buffer_size = 4096
 delay = 0.0001
-g_dev_socks = []
 
-def get_idle_sock() :
-    rets = None
-    count = 0
-    while (not rets) :
-        for s in g_dev_socks :
-            if not s['use'] :
-                rets = s
-                break
-        time.sleep(0.1)
-        count += 1
-        if count > 100 : break
+g_dev_socks = {}
+g_web_socks = []
 
-    if not rets : return None
-    g_dev_socks.remove(rets)
-    return rets['sock']
-
-def del_sock(sock) :
-    rets = None
-    for s in g_dev_socks :
-        if s['sock'] == sock :
-            rets = s
+def del_dev_sock(sock) :
+    name = None
+    for k,v in g_dev_socks.iteritems():
+        if v == sock :
+            name = k 
             break
 
-    if not rets : return 
-    g_dev_socks.remove(rets)
+    if not name : return 
+    del g_dev_socks[name]
 
 
 class HTTPRequest(BaseHTTPRequestHandler):
@@ -113,6 +99,8 @@ class TheServer:
         #request = HTTPRequest(data)
         self.channel[self.s].sendall(self.data)
 
+def parse_dev_data(data) :
+
 
 def dev_loop() :
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -133,18 +121,21 @@ def dev_loop() :
                 print 'dev loop', clientaddr, "has connected"
                 break
 
-            data = s.recv(128)
+            data = s.recv(8)
             if len(data) == 0:
-                del_sock(s)
+                del_dev_sock(s)
                 input_list.remove(s)
                 s.close()
                 print 'dev loop socket close'
                 break
 
-            input_list.remove(s)
-            g_dev_socks.append({'sock':s, 'name':data, 'use':False})
-            print 'dev loop socket got name: ' + data
-            break
+            head = parse_head(data)
+
+            if head.type == 'i' :
+                name = s.recv(head['length'])
+                g_dev_socks[name] = s
+                print 'dev loop socket got name: ', name
+                break
 
             print 'dev loop unknow error'
 

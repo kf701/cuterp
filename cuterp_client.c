@@ -181,6 +181,18 @@ struct _sock_list_t {
 #define MAX_LIST 100
 struct _sock_list_t sock_list[MAX_LIST];
 
+void log_sock_list()
+{
+    int i = 0, count = 0;
+    for (i = 0; i < MAX_LIST; i++ )
+    {
+        if (sock_list[i].index != 0) {
+            count++;
+        }
+    }
+    printf ("sock list count = %d\n", count);
+}
+
 void add_local_sock(int sock, int index)
 {
     int i = 0;
@@ -340,6 +352,8 @@ int main(int argc,char*argv[])
 
     while (1) 
     {
+        log_sock_list();
+
         evn = epoll_wait(efd, events, MAXEVENTS, -1);
 
         for(i = 0 ; i < evn ; i++){
