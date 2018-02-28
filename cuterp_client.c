@@ -116,11 +116,11 @@ int _make_non_blocking(int sfd)
     return 0;
 }
 
-int _rio_send(int sock, char* buf, int size)
+int _rio_send(int sock, void* buf, int size)
 {
     int ret = 0, rest = size;
     while(rest > 0) {
-        ret = send(sock, buf, size, 0);
+        ret = send(sock, buf, rest, 0);
         if (ret <= 0) {
             if (errno == EAGAIN) {
                 usleep(100*1000);
@@ -148,26 +148,12 @@ void add_to_epoll(int efd, int sock)
     }
 }
 
-#define HEAD_SIZE  8
 struct _head_t {
-    unsigned char buf[HEAD_SIZE];
-    int type;
-    int index;
-    int length;
+    char type;
+    char buf[3];
+    unsigned int index;
+    unsigned int length;
 };
-
-int _read_head(int sock, struct _head_t * head)
-{
-    int count = read(sock, head->buf, HEAD_SIZE);
-    if (count != HEAD_SIZE) {
-        return -1;
-    }
-
-    head->type = head->buf[0];
-    head->index = head->buf[1];
-    head->length = head->buf[4] << 24 | head->buf[5] << 16 | head->buf[6] << 8 |  head->buf[7];
-    return HEAD_SIZE;
-}
 
 char* g_server_ip   = "139.224.236.202";
 int   g_server_port = 5800;
@@ -181,12 +167,20 @@ struct _sock_list_t {
 #define MAX_LIST 100
 struct _sock_list_t sock_list[MAX_LIST];
 
+void init_sock_list()
+{
+    int i = 0;
+    for (i = 0; i < MAX_LIST; i++ ) {
+        sock_list[i].index = -1;
+    }
+}
+
 void log_sock_list()
 {
     int i = 0, count = 0;
     for (i = 0; i < MAX_LIST; i++ )
     {
-        if (sock_list[i].index != 0) {
+        if (sock_list[i].index != -1) {
             count++;
         }
     }
@@ -198,7 +192,7 @@ void add_local_sock(int sock, int index)
     int i = 0;
     for (i = 0; i < MAX_LIST; i++ )
     {
-        if (sock_list[i].index == 0) {
+        if (sock_list[i].index == -1) {
             sock_list[i].index = index;
             sock_list[i].sock = sock;
             break;
@@ -212,8 +206,8 @@ void del_local_by_sock(int sock)
     for (i = 0; i < MAX_LIST; i++ )
     {
         if (sock_list[i].sock == sock) {
-            sock_list[i].index = 0;
-            sock_list[i].sock = 0;
+            sock_list[i].index = -1;
+            sock_list[i].sock = -1;
             break;
         }
     }
@@ -228,7 +222,7 @@ int get_index_by_sock(int sock)
             return sock_list[i].index;
         }
     }
-    return 0;
+    return -1;
 }
 
 int find_local_by_index(int efd, int index)
@@ -257,17 +251,19 @@ int find_local_by_index(int efd, int index)
 
 void send_register_info(int sock)
 {
-    char buf[128] = {0};
-    buf[0] = 'i';
+    unsigned char buf[128];
     int len = strlen(g_domain);
-    buf[7] = len;
-    sprintf(buf+8, "%s", g_domain);
-	_rio_send(sock, buf, 8+len);
+    struct _head_t *head = (struct _head_t *)buf;
+    head->type = 'i';
+    head->index = 0;
+    head->length = len;
+    sprintf(buf+sizeof(struct _head_t), "%s", g_domain);
+    _rio_send(sock, (void*)buf, sizeof(struct _head_t)+len);
 }
 
 int forward_to_local(int local_sock, int sock, int index, int length)
 {
-    char buf[4096];
+    unsigned char buf[4096];
     int count = length, ret = 0, readlen = 0, realsend = 0;
 
     while (count > 0) {
@@ -283,7 +279,7 @@ int forward_to_local(int local_sock, int sock, int index, int length)
             break;
         }
         count -= ret;
-        realsend = _rio_send(local_sock, buf, ret);
+        realsend = _rio_send(local_sock, (void*)buf, ret);
         if (realsend != ret) {
             printf ("forward_packet, error, send = %d, real = %d, errno = %d\n", ret, realsend, errno);
             break;
@@ -296,30 +292,33 @@ int forward_to_local(int local_sock, int sock, int index, int length)
 int forward_to_server(int local_sock, int sock)
 {
     int index = get_index_by_sock(local_sock);
-    if (index == 0) return -1;
+    if (index == -1) return -1;
 
-    char buf[4096], headbuf[8];
-    headbuf[0] = 'd';
-    headbuf[1] = index;
+    unsigned char buf[4096];
     int ret = 0, total = 0;
+    struct _head_t head;
 
     while (1) {
         ret = read(local_sock, buf, sizeof(buf));
         if (ret <= 0) break;
 
-        headbuf[4] = (ret >> 24) & 0xFF;
-        headbuf[5] = (ret >> 16) & 0xFF;
-        headbuf[6] = (ret >> 8) & 0xFF;
-        headbuf[7] = ret & 0xFF;
+        head.type = 'd';
+        head.index = index;
+        head.length = ret;
+        
+        printf("forward_to_server, index = %d, len = %d\n", index, ret);
 
-        if (8 != _rio_send(sock, headbuf, 8)) {
+        ret = _rio_send(sock, (void*)&head, sizeof(struct _head_t));
+        if (sizeof(struct _head_t) != ret ) {
+            printf ("forward_to_server, send head error, ret = %d, errno = %d\n", ret, errno);
             break;
         }
-        if (ret != _rio_send(sock, buf, ret)) {
+        if (head.length != _rio_send(sock, (void*)buf, head.length)) {
+            printf ("forward_to_server, send data error\n");
             break;
         }
 
-        total += ret;
+        total += head.length;
     }
 
     return total;
@@ -329,11 +328,15 @@ int main(int argc,char*argv[])
 {
     signal(SIGPIPE,SIG_IGN);
 
+    init_sock_list();
+
     int sock = _tcp_connect(g_server_ip, g_server_port);
     if (sock == -1) {
         printf ("connect to server error\n");
         abort();
     }
+    printf ("connect to %s %d\n", g_server_ip, g_server_port);
+
     _make_non_blocking(sock);
 
     send_register_info(sock);
@@ -352,7 +355,7 @@ int main(int argc,char*argv[])
 
     while (1) 
     {
-        log_sock_list();
+        //log_sock_list();
 
         evn = epoll_wait(efd, events, MAXEVENTS, -1);
 
@@ -368,16 +371,18 @@ int main(int argc,char*argv[])
             }
 
             if(sock == events[i].data.fd) {
-                nread = _read_head(sock, &head);
-                if (nread != HEAD_SIZE) {
+                nread = read(sock, &head, sizeof(struct _head_t));
+                if (nread != sizeof(struct _head_t)) {
                     if (errno == EAGAIN) {
                         usleep(100*1000);
                         continue;
                     }
+                    printf ("read error\n");
                     abort();
                 }
              
                 local_sock = find_local_by_index(efd, head.index);
+                printf ("forward_to_local index = %d len = %d\n", head.index, head.length);
                 forward_to_local(local_sock, sock, head.index, head.length);
                 continue;
             }
